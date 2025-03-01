@@ -1,245 +1,138 @@
 import subprocess
 import socket
-from scapy.all import sniff, IP, TCP
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-from sklearn.ensemble import IsolationForest
 import numpy as np
-from collections import defaultdict
+import tensorflow as tf
+from scapy.all import sniff, IP, TCP
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
 
-# Session state for login persistence
-if 'authenticated' not in st.session_state:
-    st.session_state.authenticated = False
-if 'username' not in st.session_state:
-    st.session_state.username = ""
-if 'password' not in st.session_state:
-    st.session_state.password = ""
+# Initialize session state
+if "packet_data" not in st.session_state:
+    st.session_state.packet_data = pd.DataFrame(columns=["Source IP", "Destination IP", "Source Port", "Destination Port", "Packet Size", "Protocol", "Status"])
+if "blocked_ports" not in st.session_state:
+    st.session_state.blocked_ports = set()
 
 # Sidebar Login
 st.sidebar.title("Firewall Login")
-username = st.sidebar.text_input("Username", value=st.session_state.username)
-password = st.sidebar.text_input("Password", type="password", value=st.session_state.password)
+username = st.sidebar.text_input("Username")
+password = st.sidebar.text_input("Password", type="password")
 
 if st.sidebar.button("Login"):
     if username == "admin" and password == "admin":
         st.session_state.authenticated = True
-        st.session_state.username = username
-        st.session_state.password = password
         st.sidebar.success("Login successful!")
     else:
         st.sidebar.error("Invalid credentials")
 
-if not st.session_state.authenticated:
+if not st.session_state.get("authenticated", False):
     st.stop()
 
-# Network interface and initial settings
-interface = "Wi-Fi"
-packet_count = 10
-packet_records = []
-blocked_ips = set()
-blocked_ports = set()
-allowed_ips = set()
-allowed_ports = {80, 443, 22}  # Whitelist of commonly allowed ports (HTTP, HTTPS, SSH)
+# Train TensorFlow model (placeholder)
+def train_tensorflow_model():
+    train_data = np.random.rand(1000, 6)
+    X_train, X_test, _, _ = train_test_split(train_data, np.random.randint(0, 2, size=1000), test_size=0.2)
 
-# AI Model for Anomaly Detection
-model = IsolationForest(contamination=0.1, random_state=42)
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train)
+    
+    model = tf.keras.Sequential([
+        tf.keras.layers.Dense(64, activation='relu', input_shape=(6,)),
+        tf.keras.layers.Dense(32, activation='relu'),
+        tf.keras.layers.Dense(1, activation='sigmoid')
+    ])
+    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+    model.fit(X_train, np.random.randint(0, 2, size=len(X_train)), epochs=5, batch_size=32)
 
-# Generate more realistic training data
-def generate_training_data():
-    data = []
-    for _ in range(1000):
-        src_ip = f"192.168.1.{np.random.randint(1, 255)}"
-        dst_ip = f"192.168.1.{np.random.randint(1, 255)}"
-        src_port = np.random.randint(1024, 65535)
-        dst_port = np.random.choice([80, 443, 22, 8080, 3389])  # Common ports
-        packet_size = np.random.randint(64, 1500)
-        protocol = np.random.choice([0, 1])  # 0 for TCP, 1 for UDP
-        data.append([hash(src_ip) % 10000, hash(dst_ip) % 10000, src_port, dst_port, packet_size, protocol])
-    return np.array(data)
+    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    tflite_model = converter.convert()
+    
+    with open('anomaly_model.tflite', 'wb') as f:
+        f.write(tflite_model)
 
-train_data = generate_training_data()
-model.fit(train_data)  # Train the model
+    return scaler
 
-# Functions to manage Windows Firewall rules
-def block_ip_in_windows(ip):
-    rule_name = f"Block_IP_{ip}"
-    command = f'netsh advfirewall firewall add rule name="{rule_name}" protocol=ANY dir=in action=block remoteip={ip}'
+scaler = train_tensorflow_model()
+interpreter = tf.lite.Interpreter(model_path='anomaly_model.tflite')
+interpreter.allocate_tensors()
+
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
+
+# TFLite prediction
+def tflite_predict(features):
+    features = scaler.transform(features.reshape(1, -1)).astype(np.float32)
+    interpreter.set_tensor(input_details[0]['index'], features)
+    interpreter.invoke()
+    return interpreter.get_tensor(output_details[0]['index'])[0][0]
+
+# Firewall function
+def block_port(port):
     try:
+        command = f'netsh advfirewall firewall add rule name="AutoBlock_{port}" protocol=TCP dir=in action=block localport={port}'
         subprocess.run(command, shell=True, check=True)
-        st.success(f"Blocked IP: {ip}")
-    except subprocess.CalledProcessError as e:
-        st.sidebar.error(f"Failed to block IP: {e}")
-        if st.sidebar.button("Retry with Password"):
-            retry_password = st.sidebar.text_input("Enter Admin Password to Confirm", type="password")
-            if retry_password == "admin":
-                subprocess.run(command, shell=True, check=True)
-                st.success(f"Blocked IP: {ip}")
-            else:
-                st.sidebar.error("Incorrect password. IP not blocked.")
+        st.session_state.blocked_ports.add(port)
+    except Exception as e:
+        st.sidebar.error(f"Error blocking port {port}: {e}")
 
-def unblock_ip_in_windows(ip):
-    rule_name = f"Block_IP_{ip}"
-    command = f'netsh advfirewall firewall delete rule name="{rule_name}" protocol=ANY remoteip={ip}'
-    try:
-        subprocess.run(command, shell=True, check=True)
-        st.success(f"Unblocked IP: {ip}")
-    except subprocess.CalledProcessError as e:
-        st.sidebar.error(f"Failed to unblock IP: {e}")
-        if st.sidebar.button("Retry with Password"):
-            retry_password = st.sidebar.text_input("Enter Admin Password to Confirm", type="password")
-            if retry_password == "admin":
-                subprocess.run(command, shell=True, check=True)
-                st.success(f"Unblocked IP: {ip}")
-            else:
-                st.sidebar.error("Incorrect password. IP not unblocked.")
-
-def block_port_in_windows(port):
-    rule_name = f"Block_Port_{port}"
-    command = f'netsh advfirewall firewall add rule name="{rule_name}" protocol=TCP dir=in action=block localport={port}'
-    try:
-        subprocess.run(command, shell=True, check=True)
-        st.success(f"Blocked Port: {port}")
-    except subprocess.CalledProcessError as e:
-        st.sidebar.error(f"Failed to block port: {e}")
-        if st.sidebar.button("Retry with Password"):
-            retry_password = st.sidebar.text_input("Enter Admin Password to Confirm", type="password")
-            if retry_password == "admin":
-                subprocess.run(command, shell=True, check=True)
-                st.success(f"Blocked Port: {port}")
-            else:
-                st.sidebar.error("Incorrect password. Port not blocked.")
-
-def unblock_port_in_windows(port):
-    rule_name = f"Block_Port_{port}"
-    command = f'netsh advfirewall firewall delete rule name="{rule_name}" protocol=TCP localport={port}'
-    try:
-        subprocess.run(command, shell=True, check=True)
-        st.success(f"Unblocked Port: {port}")
-    except subprocess.CalledProcessError as e:
-        st.sidebar.error(f"Failed to unblock port: {e}")
-        if st.sidebar.button("Retry with Password"):
-            retry_password = st.sidebar.text_input("Enter Admin Password to Confirm", type="password")
-            if retry_password == "admin":
-                subprocess.run(command, shell=True, check=True)
-                st.success(f"Unblocked Port: {port}")
-            else:
-                st.sidebar.error("Incorrect password. Port not unblocked.")
-
-# Function to process packets
+# Process packets
 def process_packet(packet):
     if IP in packet:
         src_ip = packet[IP].src
         dst_ip = packet[IP].dst
-        src_port = packet[TCP].sport if packet.haslayer(TCP) else None
-        dst_port = packet[TCP].dport if packet.haslayer(TCP) else None
+        src_port = packet[TCP].sport if packet.haslayer(TCP) else 0
+        dst_port = packet[TCP].dport if packet.haslayer(TCP) else 0
         packet_size = len(packet)
-        protocol = 0 if packet.haslayer(TCP) else 1  # 0 for TCP, 1 for UDP
-        
-        # Features for AI model
-        features = np.array([[hash(src_ip) % 10000, hash(dst_ip) % 10000, src_port if src_port else 0, dst_port if dst_port else 0, packet_size, protocol]])
-        
-        # Predict anomaly
-        prediction = model.predict(features)
-        status = "Blocked" if prediction[0] == -1 else "Allowed"
-        
-        # Allow whitelisted ports regardless of AI prediction
-        if dst_port in allowed_ports:
-            status = "Allowed"
-        
-        if status == "Blocked":
-            blocked_ips.add(src_ip)
-            if dst_port:
-                blocked_ports.add(dst_port)
+        protocol = "TCP" if packet.haslayer(TCP) else "UDP"
+
+        features = np.array([hash(src_ip) % 10000, hash(dst_ip) % 10000, src_port, dst_port, packet_size, 0 if protocol == "TCP" else 1])
+        prediction = tflite_predict(features)
+
+        if prediction > 0.3:
+            status = "Blocked"
+            if dst_port not in st.session_state.blocked_ports:
+                block_port(dst_port)  # Auto-block suspicious ports
         else:
-            allowed_ips.add(src_ip)
-            if dst_port:
-                allowed_ports.add(dst_port)
-        
-        packet_records.append({
-            "Source IP": src_ip,
-            "Destination IP": dst_ip,
-            "Source Port": src_port,
-            "Destination Port": dst_port,
-            "Packet Size": packet_size,
-            "Protocol": "TCP" if protocol == 0 else "UDP",
-            "Status": status
+            status = "Allowed"
+
+        new_data = pd.DataFrame({
+            "Source IP": [src_ip], "Destination IP": [dst_ip],
+            "Source Port": [src_port], "Destination Port": [dst_port],
+            "Packet Size": [packet_size], "Protocol": [protocol],
+            "Status": [status]
         })
 
-# Sniff packets
-packets = sniff(count=packet_count, iface=interface)
-for packet in packets:
-    process_packet(packet)
+        st.session_state.packet_data = pd.concat([st.session_state.packet_data, new_data], ignore_index=True)
 
-# Convert packet records to a DataFrame
-packet_df = pd.DataFrame(packet_records)
+# Start sniffing packets
+def start_sniffing():
+    sniff(count=10, prn=process_packet)
 
-# Retrieve firewall's IP address
-def get_firewall_ip():
-    hostname = socket.gethostname()
-    ip_address = socket.gethostbyname(hostname)
-    return ip_address
+st.sidebar.button("Start Sniffing", on_click=start_sniffing)
 
-firewall_ip = get_firewall_ip()
-
-# Streamlit app layout
-st.title("Firewall Packet Monitoring")
-
-# Dropdown to block an IP (shows only allowed IPs)
-if allowed_ips:
-    selected_ip_to_block = st.selectbox("Block IP", list(allowed_ips))
-    if st.button("Block IP"):
-        allowed_ips.discard(selected_ip_to_block)
-        blocked_ips.add(selected_ip_to_block)
-        block_ip_in_windows(selected_ip_to_block)
+# Display Packet Data
+st.title("Live Packet Sniffing Table")
+if not st.session_state.packet_data.empty:
+    st.dataframe(st.session_state.packet_data)
 else:
-    st.warning("No IPs available to block.")
+    st.write("No packets captured yet.")
 
-# Dropdown to allow an IP (shows only blocked IPs)
-if blocked_ips:
-    selected_ip_to_allow = st.selectbox("Allow IP", list(blocked_ips))
-    if st.button("Allow IP"):
-        blocked_ips.discard(selected_ip_to_allow)
-        allowed_ips.add(selected_ip_to_allow)
-        unblock_ip_in_windows(selected_ip_to_allow)
-else:
-    st.warning("No IPs available to allow.")
-
-# Dropdown to block a port (shows only allowed ports)
-if allowed_ports:
-    selected_port_to_block = st.selectbox("Block Port", list(allowed_ports))
-    if st.button("Block Port"):
-        allowed_ports.discard(selected_port_to_block)
-        blocked_ports.add(selected_port_to_block)
-        block_port_in_windows(selected_port_to_block)
-else:
-    st.warning("No ports available to block.")
-
-# Dropdown to allow a port (shows only blocked ports)
-if blocked_ports:
-    selected_port_to_allow = st.selectbox("Allow Port", list(blocked_ports))
-    if st.button("Allow Port"):
-        blocked_ports.discard(selected_port_to_allow)
-        allowed_ports.add(selected_port_to_allow)
-        unblock_port_in_windows(selected_port_to_allow)
-else:
-    st.warning("No ports available to allow.")
-
-# Display table with packet details
-st.subheader("Packet Table")
-st.dataframe(packet_df)
-
-# Display the firewall's IP address
-st.subheader("Firewall IP Address")
-st.write(f"Firewall IP Address: {firewall_ip}")
-
-# Create a stacked bar chart if packets exist
-if not packet_df.empty:
-    packet_counts = packet_df.groupby(['Source IP', 'Status']).size().reset_index(name='Count')
-    fig = px.bar(packet_counts, x='Source IP', y='Count', color='Status',
-                 title='Packet Status by Source IP',
-                 labels={'Count': 'Number of Packets', 'Source IP': 'Source IP'},
-                 text='Count')
-    fig.update_traces(texttemplate='%{text}', textposition='outside')
-    fig.update_layout(barmode='stack', xaxis_title='Source IP', yaxis_title='Number of Packets')
+# Status Bar Chart
+if not st.session_state.packet_data.empty:
+    status_counts = st.session_state.packet_data["Status"].value_counts()
+    color_map = {"Allowed": "green", "Blocked": "orangered"}
+    fig = px.bar(
+        x=status_counts.index, 
+        y=status_counts.values, 
+        color=status_counts.index, 
+        color_discrete_map=color_map,
+        labels={"x": "Status", "y": "Count"}, 
+        title="Packet Status Analysis"
+    )
     st.plotly_chart(fig)
+
+# Show Blocked Ports
+st.sidebar.title("Blocked Ports")
+st.sidebar.write(list(st.session_state.blocked_ports))
